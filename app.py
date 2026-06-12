@@ -387,6 +387,32 @@ def _liquidity_score(r):
     return (float(vol) + float(oi)) * spread_factor
 
 
+def _tradeable(r):
+    # Drop contracts with junk data or no real market so they can't be selected.
+    iv = r.get("implied_volatility")
+    try:
+        if iv is not None and float(iv) > 3.0:        # >300% IV = stale / garbage
+            return False
+    except (TypeError, ValueError):
+        pass
+    q = r.get("last_quote") or {}
+    bid = q.get("bid")
+    try:
+        if bid is None or float(bid) <= 0:            # no bid = no way to exit
+            return False
+    except (TypeError, ValueError):
+        return False
+    day = r.get("day") or {}
+    vol = day.get("volume") or 0
+    oi = r.get("open_interest") or 0
+    try:
+        if (float(vol) + float(oi)) <= 0:             # totally dead contract
+            return False
+    except (TypeError, ValueError):
+        pass
+    return True
+
+
 def choose_contract(results, side, target_delta, target_date, delta_window=0.12):
     want = "call" if side == "call" else "put"
     cands = []
@@ -395,8 +421,11 @@ def choose_contract(results, side, target_delta, target_date, delta_window=0.12)
         if det.get("contract_type") != want:
             continue
         exp = det.get("expiration_date")
-        if exp:
-            cands.append((exp, r))
+        if not exp:
+            continue
+        if not _tradeable(r):          # skip junk before picking expiration/strike
+            continue
+        cands.append((exp, r))
     if not cands:
         return None
 
