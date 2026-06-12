@@ -25,6 +25,7 @@
 import os
 import json
 import urllib.request
+import urllib.parse
 import urllib.error
 from flask import Flask, request
 
@@ -329,11 +330,201 @@ def ida_message(d):
     return "\n".join(lines)
 
 
+import datetime as _dt
+
+
+def _today_iso():
+    return _dt.datetime.utcnow().date().isoformat()
+
+
+def _expiry_target(mode):
+    today = _dt.datetime.utcnow().date()
+    mode = (mode or "weekly").lower()
+    if mode == "0dte":
+        return today.isoformat()
+    if mode == "monthly":
+        # third Friday of this month (roll to next month if already past)
+        first = today.replace(day=1)
+        fridays = [first + _dt.timedelta(days=i) for i in range(31)
+                   if (first + _dt.timedelta(days=i)).month == first.month
+                   and (first + _dt.timedelta(days=i)).weekday() == 4]
+        third = fridays[2] if len(fridays) >= 3 else fridays[-1]
+        if third < today:
+            nm = (first + _dt.timedelta(days=32)).replace(day=1)
+            fridays = [nm + _dt.timedelta(days=i) for i in range(31)
+                       if (nm + _dt.timedelta(days=i)).month == nm.month
+                       and (nm + _dt.timedelta(days=i)).weekday() == 4]
+            third = fridays[2] if len(fridays) >= 3 else fridays[-1]
+        return third.isoformat()
+    # weekly: next Friday (today if Friday)
+    ahead = (4 - today.weekday()) % 7
+    return (today + _dt.timedelta(days=ahead)).isoformat()
+
+
+def choose_contract(results, side, target_delta, target_date):
+    want = "call" if side == "call" else "put"
+    cands = []
+    for r in results:
+        det = r.get("details", {}) or {}
+        if det.get("contract_type") != want:
+            continue
+        exp = det.get("expiration_date")
+        if exp:
+            cands.append((exp, r))
+    if not cands:
+        return None
+    exps = sorted({e for e, _ in cands})
+    chosen = next((e for e in exps if e >= target_date), exps[-1])
+    pool = [r for e, r in cands if e == chosen]
+
+    def dscore(r):
+        g = r.get("greeks") or {}
+        de = g.get("delta")
+        return 999 if de is None else abs(abs(de) - target_delta)
+
+    pool.sort(key=dscore)
+    return pool[0]
+
+
+def polygon_pick_contract(underlying, side, target_delta, mode, price):
+    if not POLYGON_API_KEY or not underlying:
+        return None
+    try:
+        tgt = _expiry_target(mode)
+        qs = [
+            ("contract_type", "call" if side == "call" else "put"),
+            ("expiration_date.gte", _today_iso()),
+            ("limit", "250"),
+            ("sort", "expiration_date"),
+            ("apiKey", POLYGON_API_KEY),
+        ]
+        if numf(price) is not None:
+            lo = float(price) * 0.80
+            hi = float(price) * 1.20
+            qs.insert(1, ("strike_price.gte", f"{lo:.2f}"))
+            qs.insert(2, ("strike_price.lte", f"{hi:.2f}"))
+        query = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in qs)
+        url = f"https://api.polygon.io/v3/snapshot/options/{urllib.parse.quote(underlying)}?{query}"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+        r = choose_contract(data.get("results", []) or [], side, target_delta, tgt)
+        if not r:
+            return None
+        det = r.get("details", {}) or {}
+        g = r.get("greeks") or {}
+        q = r.get("last_quote") or {}
+        t = r.get("last_trade") or {}
+        return {
+            "ticker": det.get("ticker"),
+            "strike": det.get("strike_price"),
+            "expiry": det.get("expiration_date"),
+            "type": det.get("contract_type"),
+            "delta": g.get("delta"),
+            "iv": r.get("implied_volatility"),
+            "oi": r.get("open_interest"),
+            "bid": q.get("bid"),
+            "ask": q.get("ask"),
+            "last": t.get("price"),
+        }
+    except Exception as e:
+        print("Polygon lookup failed:", e)
+        return None
+
+
+OPT_HIT = {
+    "options_tp1": ("TP1", "\U0001F3AF"),
+    "options_tp2": ("TP2", "\U0001F3AF"),
+    "options_tp3": ("TP3", "\U0001F48E"),
+    "options_tp4": ("TP4", "\U0001F4B0"),
+    "options_tp5": ("TP5", "\U0001F680"),
+    "options_tp6": ("TP6", "\U0001F319"),
+}
+
+
+def options_message(d):
+    sym = esc(d.get("symbol", "ALERT"))
+    code = str(d.get("orbit", ""))
+
+    if code in ("options_call", "options_put"):
+        is_call = code == "options_call"
+        side = "call" if is_call else "put"
+        cp = "C" if is_call else "P"
+        arrow = "\U0001F7E2\U0001F4C8" if is_call else "\U0001F534\U0001F4C9"
+        target_delta = numf(d.get("opt_delta")) or 0.60
+        mode = str(d.get("opt_expiry", "weekly")).lower()
+        lines = [f"{arrow} <b>{sym} \u2014 {'CALL' if is_call else 'PUT'}</b>"]
+
+        c = polygon_pick_contract(sym, side, target_delta, mode, numf(d.get("price")))
+        if c and c.get("strike") is not None:
+            strike = f"{float(c['strike']):g}"
+            lines.append(f"\U0001F4C4 <b>{sym} {strike}{cp}</b> \u00B7 exp <code>{esc(c.get('expiry') or '')}</code>")
+            met = []
+            if c.get("delta") is not None:
+                met.append(f"\u0394 {float(c['delta']):.2f}")
+            if c.get("iv") is not None:
+                met.append(f"IV {round(float(c['iv']) * 100)}%")
+            if c.get("oi") is not None:
+                met.append(f"OI {int(c['oi'])}")
+            prem = None
+            if numf(c.get("bid")) is not None and numf(c.get("ask")) is not None:
+                prem = f"{float(c['bid']):.2f}/{float(c['ask']):.2f}"
+            elif numf(c.get("last")) is not None:
+                prem = f"{float(c['last']):.2f}"
+            if prem:
+                met.append(f"${prem}")
+            if met:
+                lines.append("\U0001F4B5 " + " \u00B7 ".join(met))
+        else:
+            px_ = numf(d.get("price"))
+            step = numf(d.get("opt_strike_step")) or 1.0
+            if px_ is not None and step:
+                strike = round(px_ / step) * step
+                lines.append(f"\U0001F4C4 <b>{sym} {strike:g}{cp}</b> \u00B7 exp <code>{_expiry_target(str(d.get('opt_expiry', 'weekly')).lower())}</code> <i>(suggested)</i>")
+            lines.append("<i>live contract unavailable \u2014 suggestion only</i>")
+
+        und = []
+        if numf(d.get("price")) is not None:
+            und.append(f"Underlying {px(d.get('price'))}")
+        if numf(d.get("stop")) is not None:
+            und.append(f"\u26D4 {px(d.get('stop'))}")
+        if und:
+            lines.append("  \u00B7  ".join(und))
+        rows = [f"{em} <b>{nm}</b> {px(d.get(k))}" for k, nm, em in IDA_TP if numf(d.get(k)) is not None]
+        if rows:
+            lines.append("\U0001F3AF <b>Targets (underlying)</b>")
+            lines.extend(rows)
+        lines.append("\u2014 facts, not a forecast \U0001F916")
+        return "\n".join(lines)
+
+    if code in OPT_HIT:
+        nm, em = OPT_HIT[code]
+        key = code.replace("options_", "")
+        val = px(d.get(key)) if numf(d.get(key)) is not None else px(d.get("price"))
+        return f"{em}\U0001F4A5 <b>{sym} {nm} HIT</b> {val} \u2014 take profit \U0001F389\n\u2014 facts, not a forecast \U0001F916"
+
+    if code == "options_stop":
+        sp = px(d.get("stop")) if numf(d.get("stop")) is not None else px(d.get("price"))
+        return f"\u26D4 <b>{sym} STOPPED</b> {sp} \u2014 close it \U0001F6DF\n\u2014 facts, not a forecast \U0001F916"
+
+    if code == "options_reject":
+        rp = px(d.get("price"))
+        return f"\U0001F9F1 <b>{sym} REJECTED</b> {rp} \u2014 setup failed, stand down \U0001F440\n\u2014 facts, not a forecast \U0001F916"
+
+    lines = [f"\U0001F6F0 <b>OPTIONS \u00B7 {sym}</b>"]
+    if numf(d.get("price")) is not None:
+        lines.append(f"<i>Price: {n2(d.get('price'))}</i>")
+    lines.append("\u2014 facts, not a forecast \U0001F916")
+    return "\n".join(lines)
+
+
 def build_message(d):
     if d.get("engine") == "ari" or str(d.get("orbit", "")).startswith("ari_"):
         return ari_message(d)
     if d.get("engine") == "ida" or str(d.get("orbit", "")).startswith("ida_"):
         return ida_message(d)
+    if d.get("engine") == "options" or str(d.get("orbit", "")).startswith("options_"):
+        return options_message(d)
     return orbit_message(d)
 
 
@@ -368,9 +559,27 @@ TOPIC_ENTRIES = _env("TELEGRAM_TOPIC_ENTRIES")
 TOPIC_TARGETS = _env("TELEGRAM_TOPIC_TARGETS")
 TOPIC_CONTEXT = _env("TELEGRAM_TOPIC_CONTEXT")
 
+# Options tabs (forum thread ids) + Polygon key for real contract lookup.
+TOPIC_OPT_CALLS    = _env("TELEGRAM_TOPIC_OPT_CALLS")
+TOPIC_OPT_PUTS     = _env("TELEGRAM_TOPIC_OPT_PUTS")
+TOPIC_OPT_HIT      = _env("TELEGRAM_TOPIC_OPT_HIT")
+TOPIC_OPT_STOPPED  = _env("TELEGRAM_TOPIC_OPT_STOPPED")
+TOPIC_OPT_REJECTED = _env("TELEGRAM_TOPIC_OPT_REJECTED")
+POLYGON_API_KEY    = _env("POLYGON_API_KEY")
+
 
 def topic_for(code):
     code = str(code or "")
+    if code in ("options_call",):
+        return TOPIC_OPT_CALLS
+    if code in ("options_put",):
+        return TOPIC_OPT_PUTS
+    if code.startswith("options_tp"):
+        return TOPIC_OPT_HIT
+    if code == "options_stop":
+        return TOPIC_OPT_STOPPED
+    if code == "options_reject":
+        return TOPIC_OPT_REJECTED
     if code.startswith("ida_"):
         return TOPIC_IDA
     if code in ("ari_long", "ari_short"):
