@@ -361,7 +361,33 @@ def _expiry_target(mode):
     return (today + _dt.timedelta(days=ahead)).isoformat()
 
 
-def choose_contract(results, side, target_delta, target_date):
+def _abs_delta(r):
+    g = r.get("greeks") or {}
+    de = g.get("delta")
+    return abs(de) if de is not None else None
+
+
+def _liquidity_score(r):
+    # Liquidity = traded volume + open interest, penalized by a wide bid/ask spread.
+    day = r.get("day") or {}
+    vol = day.get("volume") or 0
+    oi = r.get("open_interest") or 0
+    q = r.get("last_quote") or {}
+    bid = q.get("bid")
+    ask = q.get("ask")
+    spread_factor = 1.0
+    try:
+        if bid is not None and ask is not None:
+            mid = (float(bid) + float(ask)) / 2.0
+            if mid > 0:
+                spread_pct = (float(ask) - float(bid)) / mid
+                spread_factor = 1.0 / (1.0 + max(0.0, spread_pct) * 3.0)
+    except (TypeError, ValueError):
+        pass
+    return (float(vol) + float(oi)) * spread_factor
+
+
+def choose_contract(results, side, target_delta, target_date, delta_window=0.12):
     want = "call" if side == "call" else "put"
     cands = []
     for r in results:
@@ -373,16 +399,25 @@ def choose_contract(results, side, target_delta, target_date):
             cands.append((exp, r))
     if not cands:
         return None
+
+    # 1) expiration: nearest one at/after the target date for the chosen style
     exps = sorted({e for e, _ in cands})
     chosen = next((e for e in exps if e >= target_date), exps[-1])
     pool = [r for e, r in cands if e == chosen]
+    if not pool:
+        return None
 
-    def dscore(r):
-        g = r.get("greeks") or {}
-        de = g.get("delta")
-        return 999 if de is None else abs(abs(de) - target_delta)
+    # 2) keep strikes whose delta is near the target (right "moneyness")
+    near = [r for r in pool
+            if _abs_delta(r) is not None and abs(_abs_delta(r) - target_delta) <= delta_window]
 
-    pool.sort(key=dscore)
+    if near:
+        # 3) among those, the most tradeable wins; break ties by delta closeness
+        near.sort(key=lambda r: (-_liquidity_score(r), abs((_abs_delta(r) or 9.0) - target_delta)))
+        return near[0]
+
+    # fallback: nothing in the delta window -> closest delta overall
+    pool.sort(key=lambda r: (999 if _abs_delta(r) is None else abs(_abs_delta(r) - target_delta)))
     return pool[0]
 
 
@@ -426,6 +461,7 @@ def polygon_pick_contract(underlying, side, target_delta, mode, price):
             "vega": g.get("vega"),
             "iv": r.get("implied_volatility"),
             "oi": r.get("open_interest"),
+            "vol": (r.get("day") or {}).get("volume"),
             "bid": q.get("bid"),
             "ask": q.get("ask"),
             "last": t.get("price"),
@@ -498,6 +534,8 @@ def options_message(d):
                     met.append(f"IV {round(float(c['iv']) * 100)}%")
                 if c.get("oi") is not None:
                     met.append(f"OI {int(c['oi'])}")
+                if c.get("vol") is not None:
+                    met.append(f"Vol {int(c['vol'])}")
                 prem = None
                 if numf(c.get("bid")) is not None and numf(c.get("ask")) is not None:
                     prem = f"{float(c['bid']):.2f}/{float(c['ask']):.2f}"
