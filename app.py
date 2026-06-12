@@ -421,6 +421,9 @@ def polygon_pick_contract(underlying, side, target_delta, mode, price):
             "expiry": det.get("expiration_date"),
             "type": det.get("contract_type"),
             "delta": g.get("delta"),
+            "theta": g.get("theta"),
+            "gamma": g.get("gamma"),
+            "vega": g.get("vega"),
             "iv": r.get("implied_volatility"),
             "oi": r.get("open_interest"),
             "bid": q.get("bid"),
@@ -442,6 +445,21 @@ OPT_HIT = {
 }
 
 
+def is_optionable(sym):
+    # Polygon options cover US equities / ETFs / indices only — not crypto or futures.
+    s = str(sym or "").upper()
+    if not s:
+        return False
+    if s.endswith("!"):       # futures (e.g. MNQ1!, NQ1!)
+        return False
+    if s.endswith(".P"):      # perpetuals
+        return False
+    for q in ("USDT", "USDC", "BUSD", "DAI", "USD"):   # crypto / forex quote currencies
+        if s.endswith(q) and len(s) > len(q):
+            return False
+    return True
+
+
 def options_message(d):
     sym = esc(d.get("symbol", "ALERT"))
     code = str(d.get("orbit", ""))
@@ -457,33 +475,40 @@ def options_message(d):
         mode = str(d.get("opt_expiry", "weekly")).lower()
         lines = [f"{arrow} <b>{sym} \u2014 {'CALL' if is_call else 'PUT'}</b>"]
 
-        c = polygon_pick_contract(sym, side, target_delta, mode, numf(d.get("price")))
-        if c and c.get("strike") is not None:
-            strike = f"{float(c['strike']):g}"
-            lines.append(f"\U0001F4C4 <b>{sym} {strike}{cp}</b> \u00B7 exp <code>{esc(c.get('expiry') or '')}</code>")
-            met = []
-            if c.get("delta") is not None:
-                met.append(f"\u0394 {float(c['delta']):.2f}")
-            if c.get("iv") is not None:
-                met.append(f"IV {round(float(c['iv']) * 100)}%")
-            if c.get("oi") is not None:
-                met.append(f"OI {int(c['oi'])}")
-            prem = None
-            if numf(c.get("bid")) is not None and numf(c.get("ask")) is not None:
-                prem = f"{float(c['bid']):.2f}/{float(c['ask']):.2f}"
-            elif numf(c.get("last")) is not None:
-                prem = f"{float(c['last']):.2f}"
-            if prem:
-                met.append(f"${prem}")
-            if met:
-                lines.append("\U0001F4B5 " + " \u00B7 ".join(met))
+        if not is_optionable(sym):
+            lines.append("ℹ️ <i>No listed options for this symbol (crypto / futures) — underlying levels only</i>")
         else:
-            px_ = numf(d.get("price"))
-            step = numf(d.get("opt_strike_step")) or 1.0
-            if px_ is not None and step:
-                strike = round(px_ / step) * step
-                lines.append(f"\U0001F4C4 <b>{sym} {strike:g}{cp}</b> \u00B7 exp <code>{_expiry_target(str(d.get('opt_expiry', 'weekly')).lower())}</code> <i>(suggested)</i>")
-            lines.append("<i>live contract unavailable \u2014 suggestion only</i>")
+            c = polygon_pick_contract(sym, side, target_delta, mode, numf(d.get("price")))
+            if c and c.get("strike") is not None:
+                strike = f"{float(c['strike']):g}"
+                exp = c.get("expiry") or ""
+                dte_s = ""
+                try:
+                    _days = (_dt.date.fromisoformat(exp) - _dt.datetime.utcnow().date()).days
+                    dte_s = f" ({_days} DTE)"
+                except Exception:
+                    dte_s = ""
+                lines.append(f"📄 <b>{sym} {strike}{cp}</b> · exp <code>{esc(exp)}</code>{dte_s}")
+                met = []
+                if c.get("delta") is not None:
+                    met.append(f"Δ {float(c['delta']):.2f}")
+                if c.get("theta") is not None:
+                    met.append(f"θ {float(c['theta']):.2f}")
+                if c.get("iv") is not None:
+                    met.append(f"IV {round(float(c['iv']) * 100)}%")
+                if c.get("oi") is not None:
+                    met.append(f"OI {int(c['oi'])}")
+                prem = None
+                if numf(c.get("bid")) is not None and numf(c.get("ask")) is not None:
+                    prem = f"{float(c['bid']):.2f}/{float(c['ask']):.2f}"
+                elif numf(c.get("last")) is not None:
+                    prem = f"{float(c['last']):.2f}"
+                if prem:
+                    met.append(f"${prem}")
+                if met:
+                    lines.append("💵 " + " · ".join(met))
+            else:
+                lines.append("ℹ️ <i>Live contract unavailable right now — underlying levels only</i>")
 
         und = []
         if numf(d.get("price")) is not None:
