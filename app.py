@@ -31,48 +31,8 @@ from flask import Flask, request
 app = Flask(__name__)
 
 TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-# Recipients: your personal chat (TELEGRAM_CHAT_ID) + the broadcast channel
-# (TELEGRAM_CHAT_CHANNEL_ID). Either var may hold a comma-separated list; both
-# are merged and de-duplicated, so every alert goes to all of them.
-CHAT_IDS = []
-for _var in ("TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_CHANNEL_ID"):
-    for _p in os.environ.get(_var, "").split(","):
-        _p = _p.strip()
-        if _p and _p not in CHAT_IDS:
-            CHAT_IDS.append(_p)
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SECRET  = os.environ.get("ORBIT_SECRET", "")
-
-# Codes to silently drop (context pings you don't want cluttering the channel).
-# Default mutes the raw EMA-cross momentum pings. Add more (comma-separated) to
-# also drop e.g. "vwap_reclaim,vwap_lost", or set MUTE_CODES="" to send all.
-MUTE_CODES = {c.strip() for c in os.environ.get("MUTE_CODES", "trend_up,trend_down").split(",") if c.strip()}
-
-# ── Topic (tab) routing — OPTIONAL ──────────────────────────────────
-# Sort alerts into TABS inside one Telegram GROUP (Topics / forum mode).
-# Leave TELEGRAM_FORUM_ID empty to disable this entirely (relay works as-is).
-# Setup: make a group, enable Topics, add the bot as admin, create tabs,
-# then set these env vars in Render:
-#   TELEGRAM_FORUM_ID       = the group id (looks like -100...)
-#   TELEGRAM_TOPIC_ENTRIES  = tab id for NEW LONG / NEW SHORT
-#   TELEGRAM_TOPIC_TARGETS  = tab id for TP hits / rejects / stop / exit / reversal
-#   TELEGRAM_TOPIC_CONTEXT  = tab id for VWAP / level / momentum context
-FORUM_ID = os.environ.get("TELEGRAM_FORUM_ID", "").strip()
-TOPIC_IDS = {
-    "entries": os.environ.get("TELEGRAM_TOPIC_ENTRIES", "").strip(),
-    "targets": os.environ.get("TELEGRAM_TOPIC_TARGETS", "").strip(),
-    "context": os.environ.get("TELEGRAM_TOPIC_CONTEXT", "").strip(),
-}
-
-def categorize(code):
-    c = str(code or "")
-    if c in ("ari_long", "ari_short"):
-        return "entries"
-    if (c.startswith("ari_tp") or c.startswith("ari_swing")
-            or c in ("ari_stop_hit", "ari_exit", "ari_reversal")
-            or c in ("tp1", "tp2", "runner", "stop", "approach",
-                     "target_met", "target_rejected", "target_retest")):
-        return "targets"
-    return "context"
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -304,51 +264,142 @@ def orbit_message(d):
 
 
 # ── router ──────────────────────────────────────────────────────────
+IDA_TP = [
+    ("tp1", "TP1", "🎯"),
+    ("tp2", "TP2", "🎯"),
+    ("tp3", "TP3", "💎"),
+    ("tp4", "TP4", "💰"),
+    ("tp5", "TP5", "🚀"),
+    ("tp6", "TP6", "🌙"),
+]
+
+IDA_HIT = {
+    "ida_tp1": ("TP1", "🎯"),
+    "ida_tp2": ("TP2", "🎯"),
+    "ida_tp3": ("TP3", "💎"),
+    "ida_tp4": ("TP4", "💰"),
+    "ida_tp5": ("TP5", "🚀"),
+    "ida_tp6": ("TP6", "🌙"),
+}
+
+
+def ida_message(d):
+    sym = esc(d.get("symbol", "ALERT"))
+    code = str(d.get("orbit", ""))
+    direction = esc(str(d.get("dir", "")))
+    if code in ("ida_long", "ida_short"):
+        is_long = code == "ida_long"
+        arrow = "🟢📈" if is_long else "🔴📉"
+        side = "LONG" if is_long else "SHORT"
+        lines = [f"{arrow} <b>{sym} — IDA {side}</b>"]
+        entry = []
+        if numf(d.get("price")) is not None:
+            entry.append(f"Entry {px(d.get('price'))}")
+        if numf(d.get("stop")) is not None:
+            entry.append(f"⛔ Stop {px(d.get('stop'))}")
+        if entry:
+            lines.append("  ·  ".join(entry))
+        rows = [f"{em} <b>{nm}</b> {px(d.get(k))}" for k, nm, em in IDA_TP if numf(d.get(k)) is not None]
+        if rows:
+            lines.append("🎯 <b>Price targets</b>")
+            lines.extend(rows)
+        ctx = []
+        if direction and direction != "WAIT":
+            ctx.append(direction)
+        if d.get("vwap"):
+            ctx.append(esc(d["vwap"]))
+        if d.get("bos") and str(d.get("bos")) != "NONE":
+            ctx.append("BOS " + esc(d["bos"]))
+        if ctx:
+            lines.append("🧭 " + " · ".join(ctx))
+        lines.append("— facts, not a forecast 🤖")
+        return "\n".join(lines)
+    if code in IDA_HIT:
+        nm, em = IDA_HIT[code]
+        key = code.replace("ida_", "")
+        val = px(d.get(key)) if numf(d.get(key)) is not None else px(d.get("price"))
+        return f"{em}💥 <b>{sym} {nm} HIT</b> {val} — bank it 🎉\n— facts, not a forecast 🤖"
+    if code == "ida_stop":
+        sp = px(d.get("stop")) if numf(d.get("stop")) is not None else px(d.get("price"))
+        return f"🛑 <b>{sym} STOPPED / REJECTED</b> {sp} — plan's done 🛟\n— facts, not a forecast 🤖"
+    lines = [f"🛰 <b>IDA · {sym}</b>"]
+    if numf(d.get("price")) is not None:
+        lines.append(f"<i>Price: {n2(d.get('price'))}</i>")
+    lines.append("— facts, not a forecast 🤖")
+    return "\n".join(lines)
+
+
 def build_message(d):
     if d.get("engine") == "ari" or str(d.get("orbit", "")).startswith("ari_"):
         return ari_message(d)
+    if d.get("engine") == "ida" or str(d.get("orbit", "")).startswith("ida_"):
+        return ida_message(d)
     return orbit_message(d)
 
 
 # ── Telegram send (stdlib only) ─────────────────────────────────────
-def send_telegram(text, code=None):
+def _id_list(*names):
+    out = []
+    for n in names:
+        for part in os.environ.get(n, "").split(","):
+            part = part.strip()
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+# Flat feed = personal chat (+ optional broadcast channel). Posts everywhere here.
+CHAT_IDS = _id_list("TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_CHANNEL_ID")
+
+# Forum / topics group + per-tab thread ids (all optional; leave unset to skip).
+FORUM_ID      = os.environ.get("TELEGRAM_FORUM_ID", "").strip()
+TOPIC_IDA     = os.environ.get("TELEGRAM_TOPIC_IDA", "").strip()
+TOPIC_ENTRIES = os.environ.get("TELEGRAM_TOPIC_ENTRIES", "").strip()
+TOPIC_TARGETS = os.environ.get("TELEGRAM_TOPIC_TARGETS", "").strip()
+TOPIC_CONTEXT = os.environ.get("TELEGRAM_TOPIC_CONTEXT", "").strip()
+
+
+def topic_for(code):
+    code = str(code or "")
+    if code.startswith("ida_"):
+        return TOPIC_IDA
+    if code in ("ari_long", "ari_short"):
+        return TOPIC_ENTRIES
+    if code.startswith("ari_tp") or code in ("ari_swing", "ari_stop_hit", "tp1", "tp2", "runner", "stop", "target_met", "target_rejected", "target_retest", "approach"):
+        return TOPIC_TARGETS
+    return TOPIC_CONTEXT
+
+
+def _post(chat_id, text, thread_id=None):
+    body = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    if thread_id:
+        try:
+            body["message_thread_id"] = int(thread_id)
+        except (TypeError, ValueError):
+            pass
+    payload = json.dumps(body).encode("utf-8")
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        print(f"Telegram error to {chat_id} (thread {thread_id}):", e.code, e.read().decode("utf-8", "ignore"))
+    except Exception as e:
+        print(f"Telegram send failed to {chat_id}:", e)
+
+
+def send_telegram(text, code=""):
     if not TOKEN:
         print("Missing TELEGRAM_TOKEN")
         return
-    if not CHAT_IDS and not FORUM_ID:
-        print("No recipients (TELEGRAM_CHAT_ID / TELEGRAM_CHAT_CHANNEL_ID / TELEGRAM_FORUM_ID)")
-        return
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-    def _post(chat_id, thread_id=None):
-        body = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        if thread_id:
-            try:
-                body["message_thread_id"] = int(thread_id)
-            except ValueError:
-                pass
-        payload = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-        tag = f"{chat_id}#{thread_id}" if thread_id else chat_id
-        try:
-            urllib.request.urlopen(req, timeout=10)
-        except urllib.error.HTTPError as e:
-            print(f"Telegram error to {tag}:", e.code, e.read().decode("utf-8", "ignore"))
-        except Exception as e:
-            print(f"Telegram send failed to {tag}:", e)
-
-    # Full-feed recipients (your chat + channel) get every message.
+    # 1) flat feed: personal chat + optional broadcast channel
     for cid in CHAT_IDS:
-        _post(cid)
-
-    # Optional: also drop the message into the matching TAB of a Topics group.
+        _post(cid, text)
+    # 2) group tab routing: drop into the matching topic if the forum is configured
     if FORUM_ID:
-        _post(FORUM_ID, TOPIC_IDS.get(categorize(code)) or None)
+        thread = topic_for(code)
+        if thread:
+            _post(FORUM_ID, text, thread)
 
 
 # ── webhook ─────────────────────────────────────────────────────────
@@ -364,11 +415,8 @@ def orbit():
     if SECRET and d.get("secret") != SECRET:
         print("Rejected alert: bad/missing secret")
         return "bad secret", 401
-    if str(d.get("orbit", "")) in MUTE_CODES:
-        print(f"[orbit] muted {d.get('orbit')}", flush=True)
-        return "muted"
     try:
-        send_telegram(build_message(d), d.get("orbit"))
+        send_telegram(build_message(d), d.get("orbit", ""))
         return "ok"
     except Exception as e:
         print("Relay error:", e)
