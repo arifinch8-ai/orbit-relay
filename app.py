@@ -34,6 +34,11 @@ TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SECRET  = os.environ.get("ORBIT_SECRET", "")
 
+# Codes to silently drop (context pings you don't want cluttering the channel).
+# Default mutes the raw EMA-cross momentum pings. Add more (comma-separated) to
+# also drop e.g. "vwap_reclaim,vwap_lost", or set MUTE_CODES="" to send all.
+MUTE_CODES = {c.strip() for c in os.environ.get("MUTE_CODES", "trend_up,trend_down").split(",") if c.strip()}
+
 
 # ── helpers ─────────────────────────────────────────────────────────
 def numf(v):
@@ -304,6 +309,9 @@ def orbit():
     if SECRET and d.get("secret") != SECRET:
         print("Rejected alert: bad/missing secret")
         return "bad secret", 401
+    if str(d.get("orbit", "")) in MUTE_CODES:
+        print(f"[orbit] muted {d.get('orbit')}", flush=True)
+        return "muted"
     try:
         send_telegram(build_message(d))
         return "ok"
