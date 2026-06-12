@@ -47,6 +47,33 @@ SECRET  = os.environ.get("ORBIT_SECRET", "")
 # also drop e.g. "vwap_reclaim,vwap_lost", or set MUTE_CODES="" to send all.
 MUTE_CODES = {c.strip() for c in os.environ.get("MUTE_CODES", "trend_up,trend_down").split(",") if c.strip()}
 
+# ── Topic (tab) routing — OPTIONAL ──────────────────────────────────
+# Sort alerts into TABS inside one Telegram GROUP (Topics / forum mode).
+# Leave TELEGRAM_FORUM_ID empty to disable this entirely (relay works as-is).
+# Setup: make a group, enable Topics, add the bot as admin, create tabs,
+# then set these env vars in Render:
+#   TELEGRAM_FORUM_ID       = the group id (looks like -100...)
+#   TELEGRAM_TOPIC_ENTRIES  = tab id for NEW LONG / NEW SHORT
+#   TELEGRAM_TOPIC_TARGETS  = tab id for TP hits / rejects / stop / exit / reversal
+#   TELEGRAM_TOPIC_CONTEXT  = tab id for VWAP / level / momentum context
+FORUM_ID = os.environ.get("TELEGRAM_FORUM_ID", "").strip()
+TOPIC_IDS = {
+    "entries": os.environ.get("TELEGRAM_TOPIC_ENTRIES", "").strip(),
+    "targets": os.environ.get("TELEGRAM_TOPIC_TARGETS", "").strip(),
+    "context": os.environ.get("TELEGRAM_TOPIC_CONTEXT", "").strip(),
+}
+
+def categorize(code):
+    c = str(code or "")
+    if c in ("ari_long", "ari_short"):
+        return "entries"
+    if (c.startswith("ari_tp") or c.startswith("ari_swing")
+            or c in ("ari_stop_hit", "ari_exit", "ari_reversal")
+            or c in ("tp1", "tp2", "runner", "stop", "approach",
+                     "target_met", "target_rejected", "target_retest")):
+        return "targets"
+    return "context"
+
 
 # ── helpers ─────────────────────────────────────────────────────────
 def numf(v):
@@ -284,25 +311,44 @@ def build_message(d):
 
 
 # ── Telegram send (stdlib only) ─────────────────────────────────────
-def send_telegram(text):
-    if not TOKEN or not CHAT_IDS:
-        print("Missing TELEGRAM_TOKEN or no chat ids (TELEGRAM_CHAT_ID / TELEGRAM_CHAT_CHANNEL_ID)")
+def send_telegram(text, code=None):
+    if not TOKEN:
+        print("Missing TELEGRAM_TOKEN")
+        return
+    if not CHAT_IDS and not FORUM_ID:
+        print("No recipients (TELEGRAM_CHAT_ID / TELEGRAM_CHAT_CHANNEL_ID / TELEGRAM_FORUM_ID)")
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    for cid in CHAT_IDS:
-        payload = json.dumps({
-            "chat_id": cid,
+
+    def _post(chat_id, thread_id=None):
+        body = {
+            "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
-        }).encode("utf-8")
+        }
+        if thread_id:
+            try:
+                body["message_thread_id"] = int(thread_id)
+            except ValueError:
+                pass
+        payload = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        tag = f"{chat_id}#{thread_id}" if thread_id else chat_id
         try:
             urllib.request.urlopen(req, timeout=10)
         except urllib.error.HTTPError as e:
-            print(f"Telegram error to {cid}:", e.code, e.read().decode("utf-8", "ignore"))
+            print(f"Telegram error to {tag}:", e.code, e.read().decode("utf-8", "ignore"))
         except Exception as e:
-            print(f"Telegram send failed to {cid}:", e)
+            print(f"Telegram send failed to {tag}:", e)
+
+    # Full-feed recipients (your chat + channel) get every message.
+    for cid in CHAT_IDS:
+        _post(cid)
+
+    # Optional: also drop the message into the matching TAB of a Topics group.
+    if FORUM_ID:
+        _post(FORUM_ID, TOPIC_IDS.get(categorize(code)) or None)
 
 
 # ── webhook ─────────────────────────────────────────────────────────
@@ -322,7 +368,7 @@ def orbit():
         print(f"[orbit] muted {d.get('orbit')}", flush=True)
         return "muted"
     try:
-        send_telegram(build_message(d))
+        send_telegram(build_message(d), d.get("orbit"))
         return "ok"
     except Exception as e:
         print("Relay error:", e)
