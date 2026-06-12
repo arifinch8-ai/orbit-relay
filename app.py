@@ -445,6 +445,8 @@ OPT_HIT = {
 def options_message(d):
     sym = esc(d.get("symbol", "ALERT"))
     code = str(d.get("orbit", ""))
+    side_lbl = str(d.get("side", "")).upper()
+    tag = f" {side_lbl}" if side_lbl in ("CALL", "PUT") else ""
 
     if code in ("options_call", "options_put"):
         is_call = code == "options_call"
@@ -501,15 +503,15 @@ def options_message(d):
         nm, em = OPT_HIT[code]
         key = code.replace("options_", "")
         val = px(d.get(key)) if numf(d.get(key)) is not None else px(d.get("price"))
-        return f"{em}\U0001F4A5 <b>{sym} {nm} HIT</b> {val} \u2014 take profit \U0001F389\n\u2014 facts, not a forecast \U0001F916"
+        return f"{em}\U0001F4A5 <b>{sym}{tag} {nm} HIT</b> {val} \u2014 take profit \U0001F389\n\u2014 facts, not a forecast \U0001F916"
 
     if code == "options_stop":
         sp = px(d.get("stop")) if numf(d.get("stop")) is not None else px(d.get("price"))
-        return f"\u26D4 <b>{sym} STOPPED</b> {sp} \u2014 close it \U0001F6DF\n\u2014 facts, not a forecast \U0001F916"
+        return f"\u26D4 <b>{sym}{tag} STOPPED</b> {sp} \u2014 close it \U0001F6DF\n\u2014 facts, not a forecast \U0001F916"
 
     if code == "options_reject":
         rp = px(d.get("price"))
-        return f"\U0001F9F1 <b>{sym} REJECTED</b> {rp} \u2014 setup failed, stand down \U0001F440\n\u2014 facts, not a forecast \U0001F916"
+        return f"\U0001F9F1 <b>{sym}{tag} REJECTED</b> {rp} \u2014 setup failed, stand down \U0001F440\n\u2014 facts, not a forecast \U0001F916"
 
     lines = [f"\U0001F6F0 <b>OPTIONS \u00B7 {sym}</b>"]
     if numf(d.get("price")) is not None:
@@ -568,18 +570,17 @@ TOPIC_OPT_REJECTED = _env("TELEGRAM_TOPIC_OPT_REJECTED")
 POLYGON_API_KEY    = _env("POLYGON_API_KEY")
 
 
-def topic_for(code):
+def topic_for(code, side=""):
     code = str(code or "")
-    if code in ("options_call",):
-        return TOPIC_OPT_CALLS
-    if code in ("options_put",):
-        return TOPIC_OPT_PUTS
-    if code.startswith("options_tp"):
-        return TOPIC_OPT_HIT
-    if code == "options_stop":
-        return TOPIC_OPT_STOPPED
-    if code == "options_reject":
-        return TOPIC_OPT_REJECTED
+    side = str(side or "").lower()
+    if code.startswith("options_"):
+        # Two tabs only: every options event (entry, hit, stop, reject) lands
+        # in the Calls or Puts tab based on the trade's side.
+        if code == "options_call":
+            return TOPIC_OPT_CALLS
+        if code == "options_put":
+            return TOPIC_OPT_PUTS
+        return TOPIC_OPT_PUTS if side == "put" else TOPIC_OPT_CALLS
     if code.startswith("ida_"):
         return TOPIC_IDA
     if code in ("ari_long", "ari_short"):
@@ -607,7 +608,7 @@ def _post(chat_id, text, thread_id=None):
         print(f"Telegram send failed to {chat_id}:", e)
 
 
-def send_telegram(text, code=""):
+def send_telegram(text, code="", side=""):
     if not TOKEN:
         print("Missing TELEGRAM_TOKEN")
         return
@@ -616,7 +617,7 @@ def send_telegram(text, code=""):
         _post(cid, text)
     # 2) group tab routing: drop into the matching topic if the forum is configured
     if FORUM_ID:
-        thread = topic_for(code)
+        thread = topic_for(code, side)
         if thread:
             _post(FORUM_ID, text, thread)
 
@@ -635,7 +636,7 @@ def orbit():
         print("Rejected alert: bad/missing secret")
         return "bad secret", 401
     try:
-        send_telegram(build_message(d), d.get("orbit", ""))
+        send_telegram(build_message(d), d.get("orbit", ""), d.get("side", ""))
         return "ok"
     except Exception as e:
         print("Relay error:", e)
