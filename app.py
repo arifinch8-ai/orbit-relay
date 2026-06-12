@@ -348,15 +348,25 @@ def _id_list(*names):
     return out
 
 
+def _env(*names):
+    # first non-empty match wins; lets you use _IDA-suffixed names to avoid
+    # duplicate-key clashes in Render, with a fallback to the plain name.
+    for n in names:
+        v = os.environ.get(n, "").strip()
+        if v:
+            return v
+    return ""
+
+
 # Flat feed = personal chat (+ optional broadcast channel). Posts everywhere here.
-CHAT_IDS = _id_list("TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_CHANNEL_ID")
+CHAT_IDS = _id_list("TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_CHANNEL_ID", "TELEGRAM_CHAT_CHANNEL_ID_IDA")
 
 # Forum / topics group + per-tab thread ids (all optional; leave unset to skip).
-FORUM_ID      = os.environ.get("TELEGRAM_FORUM_ID", "").strip()
-TOPIC_IDA     = os.environ.get("TELEGRAM_TOPIC_IDA", "").strip()
-TOPIC_ENTRIES = os.environ.get("TELEGRAM_TOPIC_ENTRIES", "").strip()
-TOPIC_TARGETS = os.environ.get("TELEGRAM_TOPIC_TARGETS", "").strip()
-TOPIC_CONTEXT = os.environ.get("TELEGRAM_TOPIC_CONTEXT", "").strip()
+FORUM_ID      = _env("TELEGRAM_FORUM_ID_IDA", "TELEGRAM_FORUM_ID")
+TOPIC_IDA     = _env("TELEGRAM_TOPIC_IDA")
+TOPIC_ENTRIES = _env("TELEGRAM_TOPIC_ENTRIES")
+TOPIC_TARGETS = _env("TELEGRAM_TOPIC_TARGETS")
+TOPIC_CONTEXT = _env("TELEGRAM_TOPIC_CONTEXT")
 
 
 def topic_for(code):
