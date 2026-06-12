@@ -31,7 +31,15 @@ from flask import Flask, request
 app = Flask(__name__)
 
 TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Recipients: your personal chat (TELEGRAM_CHAT_ID) + the broadcast channel
+# (TELEGRAM_CHAT_CHANNEL_ID). Either var may hold a comma-separated list; both
+# are merged and de-duplicated, so every alert goes to all of them.
+CHAT_IDS = []
+for _var in ("TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_CHANNEL_ID"):
+    for _p in os.environ.get(_var, "").split(","):
+        _p = _p.strip()
+        if _p and _p not in CHAT_IDS:
+            CHAT_IDS.append(_p)
 SECRET  = os.environ.get("ORBIT_SECRET", "")
 
 # Codes to silently drop (context pings you don't want cluttering the channel).
@@ -277,23 +285,24 @@ def build_message(d):
 
 # ── Telegram send (stdlib only) ─────────────────────────────────────
 def send_telegram(text):
-    if not TOKEN or not CHAT_ID:
-        print("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID")
+    if not TOKEN or not CHAT_IDS:
+        print("Missing TELEGRAM_TOKEN or no chat ids (TELEGRAM_CHAT_ID / TELEGRAM_CHAT_CHANNEL_ID)")
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = json.dumps({
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    try:
-        urllib.request.urlopen(req, timeout=10)
-    except urllib.error.HTTPError as e:
-        print("Telegram error:", e.code, e.read().decode("utf-8", "ignore"))
-    except Exception as e:
-        print("Telegram send failed:", e)
+    for cid in CHAT_IDS:
+        payload = json.dumps({
+            "chat_id": cid,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=10)
+        except urllib.error.HTTPError as e:
+            print(f"Telegram error to {cid}:", e.code, e.read().decode("utf-8", "ignore"))
+        except Exception as e:
+            print(f"Telegram send failed to {cid}:", e)
 
 
 # ── webhook ─────────────────────────────────────────────────────────
