@@ -677,7 +677,9 @@ def topic_for(code, side=""):
         return TOPIC_IDA
     if code in ("ari_long", "ari_short"):
         return TOPIC_ENTRIES
-    if code.startswith("ari_tp") or code in ("ari_swing", "ari_stop_hit", "tp1", "tp2", "runner", "stop", "target_met", "target_rejected", "target_retest", "approach"):
+    if code.endswith("_reject") or code in ("ari_stop_hit", "stop", "target_rejected"):
+        return TOPIC_REJECTED or TOPIC_TARGETS
+    if code.startswith("ari_tp") or code in ("ari_swing", "tp1", "tp2", "runner", "target_met", "target_retest", "approach"):
         return TOPIC_TARGETS
     return TOPIC_CONTEXT
 
@@ -714,6 +716,360 @@ def send_telegram(text, code="", side=""):
             _post(FORUM_ID, text, thread)
 
 
+# ════════════════════════════════════════════════════════════════════
+#  ORBIT ANALYTICS ENGINE  (stats, leaderboards, slash-commands)
+#
+#  Turns the live alert stream into a stateful desk:
+#    • records every entry / TP hit / reject / stop as an event
+#    • aggregates per-symbol performance over today / this week
+#    • powers digest tabs (IDA command center, Leaderboard, Hot, Scorecard)
+#    • answers Telegram slash-commands (/ida /entries /targets /rejected
+#      /leaderboard /hot /scorecard /status)
+#    • quality gate: optionally suppress low-grade entries
+#
+#  PERSISTENCE: events are written to ORBIT_STATE_FILE (default /tmp).
+#  On Render's FREE tier the filesystem is ephemeral — stats reset on
+#  redeploy / spin-down. Point ORBIT_STATE_FILE at a persistent disk
+#  (paid) or swap _load/_save for an external store for durable history.
+# ════════════════════════════════════════════════════════════════════
+import re
+import time as _time
+import datetime as _dt2
+
+STATE_FILE = os.environ.get("ORBIT_STATE_FILE", "/tmp/orbit_state.json")
+CRON_KEY   = _env("ORBIT_CRON_KEY") or SECRET or "orbit"
+TZ_OFFSET  = numf(os.environ.get("ORBIT_TZ_OFFSET", "-4")) or -4.0   # ET default
+MIN_GRADE  = _env("ORBIT_MIN_GRADE").upper()                          # "" = allow all
+GRADE_RANK = {"A": 4, "B": 3, "C": 2, "D": 1}
+
+# extra digest-tab thread ids (all optional)
+TOPIC_REJECTED    = _env("TELEGRAM_TOPIC_REJECTED", "TELEGRAM_TOPIC_OPT_REJECTED")
+TOPIC_LEADERBOARD = _env("TELEGRAM_TOPIC_LEADERBOARD")
+TOPIC_HOT         = _env("TELEGRAM_TOPIC_HOT")
+TOPIC_SCORECARD   = _env("TELEGRAM_TOPIC_SCORECARD", "TELEGRAM_TOPIC_DAILY_RECAP")
+
+_BOOT = _time.time()
+
+
+# ── time / persistence ──────────────────────────────────────────────
+def _now():
+    return _time.time()
+
+
+def _day_str(ts=None):
+    t = (ts if ts is not None else _now()) + TZ_OFFSET * 3600.0
+    return _dt2.datetime.utcfromtimestamp(t).strftime("%Y-%m-%d")
+
+
+def _clock(ts):
+    t = ts + TZ_OFFSET * 3600.0
+    return _dt2.datetime.utcfromtimestamp(t).strftime("%H:%M")
+
+
+_STATE = None
+
+
+def _load():
+    global _STATE
+    if _STATE is None:
+        try:
+            with open(STATE_FILE) as f:
+                _STATE = json.load(f)
+        except Exception:
+            _STATE = {"events": []}
+        if not isinstance(_STATE, dict) or "events" not in _STATE:
+            _STATE = {"events": []}
+    return _STATE
+
+
+def _save():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(_STATE, f)
+    except Exception as e:
+        print("state save failed:", e, flush=True)
+
+
+# ── classification ──────────────────────────────────────────────────
+def classify(code, engine=""):
+    """Return alert_type: entry | tp | reject | stop | context."""
+    c = str(code or "").lower()
+    if c in ("ida_long", "ida_short", "options_call", "options_put", "ari_long", "ari_short"):
+        return "entry"
+    if c in ("ida_stop", "options_stop", "ari_stop_hit", "stop"):
+        return "stop"
+    if c == "options_reject" or c.endswith("_reject") or c == "target_rejected":
+        return "reject"
+    if re.search(r"tp(\d)", c) or c in ("ari_swing", "runner", "target_met"):
+        return "tp"
+    return "context"
+
+
+def _tp_level(code, d):
+    for src in (str(code or "").lower(), str(d.get("target_name", "")).lower()):
+        m = re.search(r"tp(\d)", src)
+        if m:
+            return int(m.group(1))
+    c = str(code or "").lower()
+    if "swing" in c or c == "runner":
+        return 6
+    return None
+
+
+def record_event(d):
+    code = d.get("orbit", "")
+    typ = classify(code, d.get("engine", ""))
+    if typ == "context":
+        return
+    ev = {
+        "ts": _now(),
+        "day": _day_str(),
+        "engine": str(d.get("engine", "")).lower(),
+        "symbol": (str(d.get("symbol", "")).upper() or "?"),
+        "type": typ,
+        "tp": _tp_level(code, d),
+        "side": str(d.get("side", "")).lower(),
+        "grade": (str(d.get("grade", "")).upper() or None),
+        "winrate": numf(d.get("winrate")),
+    }
+    st = _load()
+    st["events"].append(ev)
+    if len(st["events"]) > 5000:
+        st["events"] = st["events"][-5000:]
+    _save()
+
+
+# ── windows + aggregation ───────────────────────────────────────────
+def _events(window="today"):
+    evs = _load()["events"]
+    if window == "today":
+        day = _day_str()
+        return [e for e in evs if e.get("day") == day]
+    if window == "week":
+        cut = _now() - 7 * 86400
+        return [e for e in evs if e.get("ts", 0) >= cut]
+    return list(evs)
+
+
+def agg(events):
+    out = {}
+    for e in events:
+        s = e.get("symbol", "?")
+        a = out.setdefault(s, {"entries": 0, "tp": 0, "tp_by": {}, "tp6": 0,
+                               "reject": 0, "stop": 0, "max_tp": 0,
+                               "grades": [], "winrates": [], "engines": set()})
+        a["engines"].add(e.get("engine", ""))
+        if e.get("grade"):
+            a["grades"].append(e["grade"])
+        if e.get("winrate") is not None:
+            a["winrates"].append(e["winrate"])
+        t = e.get("type")
+        if t == "entry":
+            a["entries"] += 1
+        elif t == "tp":
+            a["tp"] += 1
+            lv = e.get("tp") or 0
+            if lv:
+                a["tp_by"][lv] = a["tp_by"].get(lv, 0) + 1
+                a["max_tp"] = max(a["max_tp"], lv)
+                if lv >= 6:
+                    a["tp6"] += 1
+        elif t == "reject":
+            a["reject"] += 1
+        elif t == "stop":
+            a["stop"] += 1
+    for s, a in out.items():
+        decided = a["tp"] + a["reject"] + a["stop"]
+        a["winpct"] = (a["tp"] / decided * 100.0) if decided else None
+        a["rejpct"] = ((a["reject"] + a["stop"]) / decided * 100.0) if decided else None
+        a["last_grade"] = a["grades"][-1] if a["grades"] else None
+    return out
+
+
+def _wlabel(window):
+    return "This Week" if window == "week" else "Today"
+
+
+def _pct(x):
+    return f"{x:.0f}%" if x is not None else "—"
+
+
+# ── digest templates ────────────────────────────────────────────────
+def ida_overview(window="today"):
+    evs = _events(window)
+    a = agg(evs)
+    tot_tp = sum(v["tp"] for v in a.values())
+    tot_rej = sum(v["reject"] for v in a.values())
+    tot_stop = sum(v["stop"] for v in a.values())
+    tot_tp6 = sum(v["tp6"] for v in a.values())
+    decided = tot_tp + tot_rej + tot_stop
+    winrate = (tot_tp / decided * 100.0) if decided else None
+    ranked = sorted(a.items(), key=lambda kv: (kv[1]["tp"], -(kv[1]["reject"] + kv[1]["stop"])), reverse=True)
+    lines = [f"📊 <b>ORBIT — IDA COMMAND CENTER · {_wlabel(window)}</b>"]
+    lines.append(f"Win rate <b>{_pct(winrate)}</b>  ·  TP hits <b>{tot_tp}</b>  ·  TP6 <b>{tot_tp6}</b>")
+    lines.append(f"Rejections <b>{tot_rej}</b>  ·  Stop-outs <b>{tot_stop}</b>")
+    if ranked:
+        lines.append("")
+        lines.append("<b>Top symbols</b>")
+        for i, (s, v) in enumerate(ranked[:6], 1):
+            lines.append(f"{i}. <code>{esc(s)}</code> — {v['tp']} TP · {_pct(v['winpct'])} · maxTP{v['max_tp'] or '-'}")
+        graded = [(s, v) for s, v in a.items() if v["winpct"] is not None]
+        if graded:
+            best = max(graded, key=lambda kv: kv[1]["winpct"])
+            worst = min(graded, key=lambda kv: kv[1]["winpct"])
+            lines.append("")
+            lines.append(f"Best <code>{esc(best[0])}</code> ({_pct(best[1]['winpct'])})  ·  Worst <code>{esc(worst[0])}</code> ({_pct(worst[1]['winpct'])})")
+    else:
+        lines.append("\n<i>No graded activity yet.</i>")
+    lines.append("\n— stats, not advice 🤖")
+    return "\n".join(lines)
+
+
+def leaderboard(window="today"):
+    a = agg(_events(window))
+    lines = [f"🏆 <b>ORBIT LEADERBOARD · {_wlabel(window)}</b>"]
+    if not a:
+        return lines[0] + "\n\n<i>No activity yet.</i>"
+    decided = {s: v for s, v in a.items() if v["winpct"] is not None}
+    if decided:
+        bw = max(decided.items(), key=lambda kv: kv[1]["winpct"])
+        lines.append(f"Best win rate — <code>{esc(bw[0])}</code> {_pct(bw[1]['winpct'])}")
+    mt = max(a.items(), key=lambda kv: kv[1]["tp"])
+    lines.append(f"Most TP hits — <code>{esc(mt[0])}</code> {mt[1]['tp']}")
+    m6 = max(a.items(), key=lambda kv: kv[1]["tp6"])
+    if m6[1]["tp6"] > 0:
+        lines.append(f"Most TP6 — <code>{esc(m6[0])}</code> {m6[1]['tp6']}")
+    lr = min(a.items(), key=lambda kv: (kv[1]["reject"] + kv[1]["stop"]))
+    lines.append(f"Fewest rejects — <code>{esc(lr[0])}</code> {lr[1]['reject'] + lr[1]['stop']}")
+    if decided:
+        worst = min(decided.items(), key=lambda kv: kv[1]["winpct"])
+        lines.append(f"\nBest overall <code>{esc(bw[0])}</code>  ·  Worst <code>{esc(worst[0])}</code>")
+    lines.append("\n— stats, not advice 🤖")
+    return "\n".join(lines)
+
+
+def hot_symbols(window="today"):
+    a = agg(_events(window))
+    hot = []
+    for s, v in a.items():
+        if v["winpct"] is None:
+            continue
+        recent_a = v["last_grade"] == "A"
+        if v["winpct"] >= 70 and (v["rejpct"] is None or v["rejpct"] < 20) and v["tp"] >= 2 and recent_a:
+            hot.append((s, v))
+    hot.sort(key=lambda kv: kv[1]["winpct"], reverse=True)
+    lines = [f"🔥 <b>HOT SYMBOLS · {_wlabel(window)}</b>",
+             "<i>Win&gt;70% · rejects&lt;20% · recent Grade A · ≥2 TP</i>"]
+    if not hot:
+        lines.append("\n<i>None clear the bar right now. Stay patient.</i>")
+    else:
+        for s, v in hot:
+            lines.append(f"• <code>{esc(s)}</code>  {_pct(v['winpct'])} · rej {_pct(v['rejpct'])} · {v['last_grade']} · maxTP{v['max_tp']}")
+    lines.append("\n— stats, not advice 🤖")
+    return "\n".join(lines)
+
+
+def scorecard(window="today"):
+    a = agg(_events(window))
+    lines = [f"📅 <b>ORBIT SCORECARD · {_wlabel(window)}</b>"]
+    if not a:
+        return lines[0] + "\n\n<i>No activity yet.</i>"
+    decided = {s: v for s, v in a.items() if v["winpct"] is not None}
+    if decided:
+        best = max(decided.items(), key=lambda kv: (kv[1]["winpct"], kv[1]["tp"]))
+        lines.append(f"Best symbol — <code>{esc(best[0])}</code> ({_pct(best[1]['winpct'])}, {best[1]['tp']} TP)")
+    clean = [(s, v) for s, v in a.items() if v["tp"] >= 1]
+    if clean:
+        cleanest = min(clean, key=lambda kv: (kv[1]["reject"] + kv[1]["stop"]))
+        lines.append(f"Cleanest — <code>{esc(cleanest[0])}</code> ({cleanest[1]['reject'] + cleanest[1]['stop']} rejects)")
+    noisiest = max(a.items(), key=lambda kv: (kv[1]["reject"] + kv[1]["stop"]))
+    if (noisiest[1]["reject"] + noisiest[1]["stop"]) > 0:
+        lines.append(f"Noisiest — <code>{esc(noisiest[0])}</code> ({noisiest[1]['reject'] + noisiest[1]['stop']} rejects/stops)")
+    tot_tp = sum(v["tp"] for v in a.values())
+    tot_rej = sum(v["reject"] for v in a.values())
+    tot_stop = sum(v["stop"] for v in a.values())
+    lines.append(f"\nTotals — TP <b>{tot_tp}</b> · Rejects <b>{tot_rej}</b> · Stops <b>{tot_stop}</b>")
+    lines.append("\n— stats, not advice 🤖")
+    return "\n".join(lines)
+
+
+def _recent(window, types, title, emoji):
+    evs = [e for e in _events(window) if e.get("type") in types]
+    evs = sorted(evs, key=lambda e: e.get("ts", 0), reverse=True)[:10]
+    lines = [f"{emoji} <b>{title} · {_wlabel(window)}</b>"]
+    if not evs:
+        lines.append("\n<i>Nothing yet.</i>")
+        return "\n".join(lines)
+    for e in evs:
+        sd = (e.get("side") or "").upper()
+        tp = f" TP{e['tp']}" if e.get("tp") else ""
+        gr = f" · {e['grade']}" if e.get("grade") else ""
+        lines.append(f"• <code>{esc(e['symbol'])}</code> {sd}{tp}{gr}  <i>{_clock(e.get('ts', _now()))}</i>")
+    return "\n".join(lines)
+
+
+def status_msg():
+    evs = _load()["events"]
+    today = _events("today")
+    up = int(_now() - _BOOT)
+    h, m = up // 3600, (up % 3600) // 60
+    fid = "set" if FORUM_ID else "—"
+    return ("🛰 <b>ORBIT RELAY STATUS</b>\n"
+            f"Uptime <b>{h}h {m}m</b>  ·  events stored <b>{len(evs)}</b> (today {len(today)})\n"
+            f"Forum {fid}  ·  min grade {MIN_GRADE or 'all'}\n"
+            f"Tabs: IDA {'✓' if TOPIC_IDA else '—'} · Entries {'✓' if TOPIC_ENTRIES else '—'} · "
+            f"Targets {'✓' if TOPIC_TARGETS else '—'} · Rejected {'✓' if TOPIC_REJECTED else '—'} · "
+            f"Leaderboard {'✓' if TOPIC_LEADERBOARD else '—'} · Hot {'✓' if TOPIC_HOT else '—'} · "
+            f"Scorecard {'✓' if TOPIC_SCORECARD else '—'}")
+
+
+# ── command dispatch ────────────────────────────────────────────────
+def cmd_response(text):
+    parts = str(text or "").strip().split()
+    if not parts:
+        return None
+    cmd = parts[0].lstrip("/").split("@")[0].lower()
+    window = "week" if "week" in text.lower() else "today"
+    if cmd == "ida":
+        return ida_overview(window)
+    if cmd == "entries":
+        return _recent(window, ("entry",), "RECENT ENTRIES", "📥")
+    if cmd == "targets":
+        return _recent(window, ("tp",), "RECENT TP HITS", "🎯")
+    if cmd == "rejected":
+        return _recent(window, ("reject", "stop"), "RECENT REJECTS / STOPS", "⚠️")
+    if cmd == "leaderboard":
+        return leaderboard(window)
+    if cmd == "hot":
+        return hot_symbols(window)
+    if cmd == "scorecard":
+        return scorecard(window)
+    if cmd == "status":
+        return status_msg()
+    if cmd in ("help", "start"):
+        return ("🛰 <b>ORBIT commands</b>\n"
+                "/ida — accuracy command center\n"
+                "/entries — recent entries\n"
+                "/targets — recent TP hits\n"
+                "/rejected — recent rejects/stops\n"
+                "/leaderboard — best symbols\n"
+                "/hot — only the cleanest setups\n"
+                "/scorecard — day recap\n"
+                "/status — relay health\n"
+                "<i>add 'week' to any command for the 7-day view</i>")
+    return None
+
+
+def passes_quality(d):
+    """Entry quality gate. Empty MIN_GRADE = allow all; missing grade = allow."""
+    if not MIN_GRADE:
+        return True
+    g = str(d.get("grade", "")).upper()
+    if not g:
+        return True
+    return GRADE_RANK.get(g, 0) >= GRADE_RANK.get(MIN_GRADE, 0)
+
+
 # ── webhook ─────────────────────────────────────────────────────────
 @app.route("/orbit", methods=["POST"])
 def orbit():
@@ -728,7 +1084,13 @@ def orbit():
         print("Rejected alert: bad/missing secret")
         return "bad secret", 401
     try:
-        send_telegram(build_message(d), d.get("orbit", ""), d.get("side", ""))
+        code = d.get("orbit", "")
+        side = d.get("side", "")
+        record_event(d)
+        if classify(code, d.get("engine", "")) == "entry" and not passes_quality(d):
+            print(f"[orbit] filtered low-grade entry {d.get('symbol')} grade={d.get('grade')}", flush=True)
+            return "ok (filtered)"
+        send_telegram(build_message(d), code, side)
         return "ok"
     except Exception as e:
         print("Relay error:", e)
@@ -738,6 +1100,62 @@ def orbit():
 @app.route("/")
 def home():
     return "ORBIT × Ari relay is up. POST alerts to /orbit"
+
+
+@app.route("/telegram", methods=["POST"])
+def telegram_hook():
+    # Receives bot updates (slash-commands) after setWebhook. Replies in-thread.
+    u = request.get_json(silent=True) or {}
+    msg = u.get("message") or u.get("channel_post") or u.get("edited_message") or {}
+    text = msg.get("text", "") or ""
+    chat = (msg.get("chat") or {}).get("id")
+    thread = msg.get("message_thread_id")
+    if text.startswith("/") and chat is not None:
+        resp = cmd_response(text)
+        if resp:
+            _post(chat, resp, thread)
+    return "ok"
+
+
+@app.route("/cron", methods=["GET", "POST"])
+def cron():
+    # Hit this from a free external scheduler to post digests on a timer.
+    #   /cron?key=YOURKEY&what=scorecard&window=today
+    if request.args.get("key") != CRON_KEY:
+        return "no", 401
+    what = request.args.get("what", "scorecard")
+    window = request.args.get("window", "today")
+    if not FORUM_ID:
+        return "no forum", 200
+    routing = {
+        "scorecard":   (TOPIC_SCORECARD,   scorecard),
+        "leaderboard": (TOPIC_LEADERBOARD, leaderboard),
+        "hot":         (TOPIC_HOT,         hot_symbols),
+        "ida":         (TOPIC_IDA,         ida_overview),
+    }
+    if what in routing:
+        thread, fn = routing[what]
+        if thread:
+            _post(FORUM_ID, fn(window), thread)
+            return "posted"
+    return "skipped"
+
+
+@app.route("/set_command_webhook")
+def set_command_webhook():
+    # One-time: registers {host}/telegram with Telegram so slash-commands work.
+    # NOTE: this disables getUpdates for the bot (you already have your tab ids).
+    if request.args.get("key") != CRON_KEY:
+        return "no", 401
+    url = request.host_url.rstrip("/") + "/telegram"
+    api = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
+    body = json.dumps({"url": url, "allowed_updates": ["message", "channel_post"]}).encode("utf-8")
+    req = urllib.request.Request(api, data=body, headers={"Content-Type": "application/json"})
+    try:
+        r = urllib.request.urlopen(req, timeout=10)
+        return r.read().decode("utf-8", "ignore")
+    except Exception as e:
+        return f"error: {e}", 500
 
 
 if __name__ == "__main__":
