@@ -895,8 +895,25 @@ def _pct(x):
 
 
 # ── digest templates ────────────────────────────────────────────────
-def ida_overview(window="today"):
-    evs = _events(window)
+def _scope_filter(events, scope):
+    if scope == "calls":
+        return [e for e in events if e.get("side") == "call"]
+    if scope == "puts":
+        return [e for e in events if e.get("side") == "put"]
+    if scope == "options":
+        return [e for e in events if e.get("engine") == "options"]
+    if scope == "futures":
+        return [e for e in events if e.get("engine") in ("ari", "ida", "orbit")]
+    return events
+
+
+def _scope_label(scope):
+    return {"calls": " · Calls", "puts": " · Puts",
+            "options": " · Options", "futures": " · Futures"}.get(scope, "")
+
+
+def ida_overview(window="today", scope="all"):
+    evs = _scope_filter(_events(window), scope)
     a = agg(evs)
     tot_tp = sum(v["tp"] for v in a.values())
     tot_rej = sum(v["reject"] for v in a.values())
@@ -905,7 +922,7 @@ def ida_overview(window="today"):
     decided = tot_tp + tot_rej + tot_stop
     winrate = (tot_tp / decided * 100.0) if decided else None
     ranked = sorted(a.items(), key=lambda kv: (kv[1]["tp"], -(kv[1]["reject"] + kv[1]["stop"])), reverse=True)
-    lines = [f"📊 <b>ORBIT — IDA COMMAND CENTER · {_wlabel(window)}</b>"]
+    lines = [f"📊 <b>ORBIT — IDA COMMAND CENTER · {_wlabel(window)}{_scope_label(scope)}</b>"]
     lines.append(f"Win rate <b>{_pct(winrate)}</b>  ·  TP hits <b>{tot_tp}</b>  ·  TP6 <b>{tot_tp6}</b>")
     lines.append(f"Rejections <b>{tot_rej}</b>  ·  Stop-outs <b>{tot_stop}</b>")
     if ranked:
@@ -925,9 +942,9 @@ def ida_overview(window="today"):
     return "\n".join(lines)
 
 
-def leaderboard(window="today"):
-    a = agg(_events(window))
-    lines = [f"🏆 <b>ORBIT LEADERBOARD · {_wlabel(window)}</b>"]
+def leaderboard(window="today", scope="all"):
+    a = agg(_scope_filter(_events(window), scope))
+    lines = [f"🏆 <b>ORBIT LEADERBOARD · {_wlabel(window)}{_scope_label(scope)}</b>"]
     if not a:
         return lines[0] + "\n\n<i>No activity yet.</i>"
     decided = {s: v for s, v in a.items() if v["winpct"] is not None}
@@ -948,8 +965,8 @@ def leaderboard(window="today"):
     return "\n".join(lines)
 
 
-def hot_symbols(window="today"):
-    a = agg(_events(window))
+def hot_symbols(window="today", scope="all"):
+    a = agg(_scope_filter(_events(window), scope))
     hot = []
     for s, v in a.items():
         if v["winpct"] is None:
@@ -958,7 +975,7 @@ def hot_symbols(window="today"):
         if v["winpct"] >= 70 and (v["rejpct"] is None or v["rejpct"] < 20) and v["tp"] >= 2 and recent_a:
             hot.append((s, v))
     hot.sort(key=lambda kv: kv[1]["winpct"], reverse=True)
-    lines = [f"🔥 <b>HOT SYMBOLS · {_wlabel(window)}</b>",
+    lines = [f"🔥 <b>HOT SYMBOLS · {_wlabel(window)}{_scope_label(scope)}</b>",
              "<i>Win&gt;70% · rejects&lt;20% · recent Grade A · ≥2 TP</i>"]
     if not hot:
         lines.append("\n<i>None clear the bar right now. Stay patient.</i>")
@@ -969,9 +986,9 @@ def hot_symbols(window="today"):
     return "\n".join(lines)
 
 
-def scorecard(window="today"):
-    a = agg(_events(window))
-    lines = [f"📅 <b>ORBIT SCORECARD · {_wlabel(window)}</b>"]
+def scorecard(window="today", scope="all"):
+    a = agg(_scope_filter(_events(window), scope))
+    lines = [f"📅 <b>ORBIT SCORECARD · {_wlabel(window)}{_scope_label(scope)}</b>"]
     if not a:
         return lines[0] + "\n\n<i>No activity yet.</i>"
     decided = {s: v for s, v in a.items() if v["winpct"] is not None}
@@ -993,10 +1010,10 @@ def scorecard(window="today"):
     return "\n".join(lines)
 
 
-def _recent(window, types, title, emoji):
-    evs = [e for e in _events(window) if e.get("type") in types]
+def _recent(window, types, title, emoji, scope="all"):
+    evs = [e for e in _scope_filter(_events(window), scope) if e.get("type") in types]
     evs = sorted(evs, key=lambda e: e.get("ts", 0), reverse=True)[:10]
-    lines = [f"{emoji} <b>{title} · {_wlabel(window)}</b>"]
+    lines = [f"{emoji} <b>{title} · {_wlabel(window)}{_scope_label(scope)}</b>"]
     if not evs:
         lines.append("\n<i>Nothing yet.</i>")
         return "\n".join(lines)
@@ -1029,21 +1046,27 @@ def cmd_response(text):
     if not parts:
         return None
     cmd = parts[0].lstrip("/").split("@")[0].lower()
-    window = "week" if "week" in text.lower() else "today"
+    low = text.lower()
+    window = "week" if "week" in low else "today"
+    scope = "all"
+    for sc in ("calls", "puts", "options", "futures"):
+        if sc in low:
+            scope = sc
+            break
     if cmd == "ida":
-        return ida_overview(window)
+        return ida_overview(window, scope)
     if cmd == "entries":
-        return _recent(window, ("entry",), "RECENT ENTRIES", "📥")
+        return _recent(window, ("entry",), "RECENT ENTRIES", "📥", scope)
     if cmd == "targets":
-        return _recent(window, ("tp",), "RECENT TP HITS", "🎯")
+        return _recent(window, ("tp",), "RECENT TP HITS", "🎯", scope)
     if cmd == "rejected":
-        return _recent(window, ("reject", "stop"), "RECENT REJECTS / STOPS", "⚠️")
+        return _recent(window, ("reject", "stop"), "RECENT REJECTS / STOPS", "⚠️", scope)
     if cmd == "leaderboard":
-        return leaderboard(window)
+        return leaderboard(window, scope)
     if cmd == "hot":
-        return hot_symbols(window)
+        return hot_symbols(window, scope)
     if cmd == "scorecard":
-        return scorecard(window)
+        return scorecard(window, scope)
     if cmd == "status":
         return status_msg()
     if cmd in ("help", "start"):
@@ -1056,7 +1079,8 @@ def cmd_response(text):
                 "/hot — only the cleanest setups\n"
                 "/scorecard — day recap\n"
                 "/status — relay health\n"
-                "<i>add 'week' to any command for the 7-day view</i>")
+                "<i>add 'week' for 7-day · add 'calls' or 'puts' to filter</i>\n"
+                "<i>e.g. /hot calls · /leaderboard puts week</i>")
     return None
 
 
@@ -1125,6 +1149,7 @@ def cron():
         return "no", 401
     what = request.args.get("what", "scorecard")
     window = request.args.get("window", "today")
+    scope = request.args.get("scope", "all")
     if not FORUM_ID:
         return "no forum", 200
     routing = {
@@ -1136,7 +1161,7 @@ def cron():
     if what in routing:
         thread, fn = routing[what]
         if thread:
-            _post(FORUM_ID, fn(window), thread)
+            _post(FORUM_ID, fn(window, scope), thread)
             return "posted"
     return "skipped"
 
