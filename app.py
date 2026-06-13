@@ -1135,8 +1135,8 @@ def telegram_hook():
     chat = (msg.get("chat") or {}).get("id")
     thread = msg.get("message_thread_id")
     if text.startswith("/") and chat is not None:
-        low = text.lower()
-        if low.startswith("/id") or low.startswith("/whereami"):
+        cmd_word = text.strip().split()[0].lstrip("/").split("@")[0].lower()
+        if cmd_word in ("id", "whereami", "thread"):
             tid = thread if thread is not None else "General (no topic)"
             _post(chat, f"🪪 This tab's <b>thread id</b>: <code>{tid}</code>\nchat id: <code>{chat}</code>", thread)
             return "ok"
